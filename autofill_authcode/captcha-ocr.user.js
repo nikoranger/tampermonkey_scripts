@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图片验证码自动识别（ddddocr ONNX / Tesseract.js）
 // @namespace    https://github.com/nikoranger/tampermonkey_scripts/tree/main/autofill_authcode
-// @version      1.1.0
+// @version      1.2.0
 // @description  自动识别页面图片验证码并填入对应输入框；ddddocr ONNX 与 Tesseract.js 双引擎，可在油猴脚本菜单切换
 // @author       niko
 // @license      MIT
@@ -34,6 +34,7 @@
  * 3. 引擎 B 的 worker / core / 语言包默认从 jsDelivr 加载。若你的网络访问不了 jsDelivr，
  *    请修改下方 DEFAULT_SETTINGS 里的 tesseract* 路径（unpkg 等镜像亦可）；同理可修改 ortWasmPaths。
  * 4. 站点定位：使用通用启发式，根据输入框/图片提示词与页面布局自动配对。
+ *    特殊页面可从菜单进入“手动选择验证码与填充位置”，选择结果仅保存在本地。
  * 5. 跨域图片默认跳过；确实需要时，在菜单开启“跨域图片读取”并把图片域名加入 @connect。
  *    对每次请求都会刷新的一次性验证码，二次获取可能使当前验证码失效，请勿开启。
  * 6. 支持字符型验证码；滑块/拼图/点选类验证码不适用。
@@ -73,6 +74,7 @@
   };
 
   const SETTINGS_KEY = 'captchaOcr.settings.v1';
+  const MANUAL_PICKS_KEY = 'captchaOcr.manualPicks.v1';
   const CACHE_NAME = 'captcha-ocr-v1';
   const REMOTE_MODEL_CACHE_KEY = '__captcha_ocr_remote_model__';
   const LOCAL_MODEL_CACHE_KEY = '__captcha_ocr_local_model__';
@@ -114,6 +116,8 @@
   // ========================= 设置与菜单 =========================
   const settings = Object.assign({}, DEFAULT_SETTINGS, GM_getValue(SETTINGS_KEY, {}) || {});
   if (!['auto', 'ddddocr', 'tesseract'].includes(settings.engine)) settings.engine = 'auto';
+  const storedManualPicks = GM_getValue(MANUAL_PICKS_KEY, {});
+  const manualPicks = storedManualPicks && typeof storedManualPicks === 'object' ? storedManualPicks : {};
   const menuIds = [];
 
   function saveSettings() {
@@ -172,6 +176,12 @@
     registerMenu('立即识别并填入当前页面验证码', () => {
       scan(true);
       toast('开始识别…');
+    });
+    registerMenu('手动选择验证码与填充位置…', () => {
+      startManualPicker();
+    });
+    registerMenu('清除当前页面手动选择', () => {
+      clearManualPick();
     });
     registerMenu('导入本地 ddddocr 模型文件…', () => {
       showImportDialog();
@@ -1042,6 +1052,12 @@
     return ['text', 'search', 'tel', 'number', ''].includes(type) && !el.disabled && !el.readOnly;
   }
 
+  function isFillTarget(el) {
+    if (!el) return false;
+    if (el.tagName === 'TEXTAREA') return !el.disabled && !el.readOnly;
+    return isTextInput(el);
+  }
+
   function isPlausibleCaptcha(el) {
     const rect = el.getBoundingClientRect();
     let w = rect.width;
@@ -1148,6 +1164,279 @@
     }
 
     return pairs;
+  }
+
+  // ========================= 手动拾取 =========================
+  let manualPickerCleanup = null;
+
+  function manualPageKey() {
+    const text = location.origin + location.pathname + location.hash;
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return 'p' + (hash >>> 0).toString(36);
+  }
+
+  function saveManualPicks() {
+    try { GM_setValue(MANUAL_PICKS_KEY, manualPicks); } catch (e) { warn('保存手动选择失败', e); }
+  }
+
+  function cssIdEscape(value) {
+    if (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') return CSS.escape(value);
+    return String(value).replace(/([^\w-])/g, '\\$1');
+  }
+
+  function cssStringEscape(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\a ');
+  }
+
+  function selectorIsUnique(selector, element) {
+    try {
+      const nodes = document.querySelectorAll(selector);
+      return nodes.length === 1 && nodes[0] === element;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function uniqueSelector(element) {
+    if (!element || element.nodeType !== 1) return null;
+    if (element.id) {
+      const selector = '#' + cssIdEscape(element.id);
+      if (selectorIsUnique(selector, element)) return selector;
+    }
+
+    const tag = element.tagName.toLowerCase();
+    const attrs = ['data-testid', 'data-test', 'data-qa', 'name', 'aria-label', 'placeholder'];
+    for (const attr of attrs) {
+      const value = element.getAttribute(attr);
+      if (!value) continue;
+      const selector = tag + '[' + attr + '="' + cssStringEscape(value) + '"]';
+      if (selectorIsUnique(selector, element)) return selector;
+    }
+
+    const parts = [];
+    let node = element;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      if (node !== element && node.id) {
+        const idSelector = '#' + cssIdEscape(node.id);
+        if (selectorIsUnique(idSelector, node)) {
+          parts.unshift(idSelector);
+          break;
+        }
+      }
+      if (node === document.body) break;
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (!parent) return null;
+      const sameTag = Array.from(parent.children).filter(child => child.tagName === node.tagName);
+      if (sameTag.length > 1) part += ':nth-of-type(' + (sameTag.indexOf(node) + 1) + ')';
+      parts.unshift(part);
+      node = parent;
+    }
+    const selector = parts.join(' > ');
+    return selector && selectorIsUnique(selector, element) ? selector : null;
+  }
+
+  function findVisibleSelectorMatch(selector, predicate) {
+    if (!selector) return null;
+    try {
+      for (const element of document.querySelectorAll(selector)) {
+        if (predicate(element) && isVisible(element)) return element;
+      }
+    } catch (e) {
+      debug('手动选择器无效：' + selector);
+    }
+    return null;
+  }
+
+  function resolveManualPair() {
+    const pick = manualPicks[manualPageKey()];
+    if (!pick || !pick.image || !pick.input) return null;
+    const image = findVisibleSelectorMatch(pick.image, el => el.tagName === 'IMG' || el.tagName === 'CANVAS');
+    const input = findVisibleSelectorMatch(pick.input, isFillTarget);
+    if (!image || !input) {
+      debug('当前页面的手动选择暂未匹配到可见元素');
+      return null;
+    }
+    return { input, image };
+  }
+
+  function clearManualPick() {
+    const key = manualPageKey();
+    if (!manualPicks[key]) {
+      toast('当前页面没有保存手动选择');
+      return;
+    }
+    delete manualPicks[key];
+    saveManualPicks();
+    toast('已清除当前页面的手动选择');
+    scan(false);
+  }
+
+  function startManualPicker() {
+    if (manualPickerCleanup) {
+      toast('手动选择已在进行中');
+      return;
+    }
+
+    let stage = 'image';
+    let selectedImage = null;
+
+    const banner = document.createElement('div');
+    banner.setAttribute('data-captcha-ocr-picker', '1');
+    banner.style.cssText = [
+      'position:fixed', 'left:50%', 'top:16px', 'transform:translateX(-50%)',
+      'z-index:2147483647', 'display:flex', 'align-items:center', 'gap:12px',
+      'padding:10px 12px 10px 16px', 'background:#111827', 'color:#fff',
+      'border:1px solid rgba(255,255,255,.18)', 'border-radius:8px',
+      'box-shadow:0 8px 30px rgba(0,0,0,.35)', 'font:13px/1.5 system-ui,sans-serif',
+      'pointer-events:auto',
+    ].join(';');
+
+    const instruction = document.createElement('span');
+    instruction.textContent = '第 1 步：点击验证码图片或画布';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = '取消';
+    cancel.style.cssText = 'padding:4px 10px;border:1px solid #6b7280;border-radius:5px;background:transparent;color:#fff;cursor:pointer;font:inherit;';
+    banner.appendChild(instruction);
+    banner.appendChild(cancel);
+
+    const ring = document.createElement('div');
+    ring.setAttribute('data-captcha-ocr-picker', '1');
+    ring.style.cssText = [
+      'position:fixed', 'display:none', 'pointer-events:none', 'z-index:2147483646',
+      'border:2px solid #3b82f6', 'border-radius:5px', 'background:rgba(59,130,246,.12)',
+      'box-shadow:0 0 0 2px rgba(255,255,255,.85),0 0 14px rgba(59,130,246,.7)',
+    ].join(';');
+
+    document.documentElement.appendChild(ring);
+    document.documentElement.appendChild(banner);
+
+    const isPickerUi = (target) => !!(target && target.closest && target.closest('[data-captcha-ocr-picker]'));
+
+    function candidateFor(target) {
+      if (!target || !target.closest) return null;
+      return target.closest(stage === 'image' ? 'img, canvas' : 'input, textarea');
+    }
+
+    function showRing(candidate) {
+      if (!candidate || !isVisible(candidate)) {
+        ring.style.display = 'none';
+        return;
+      }
+      const rect = candidate.getBoundingClientRect();
+      ring.style.display = 'block';
+      ring.style.left = Math.max(0, rect.left - 3) + 'px';
+      ring.style.top = Math.max(0, rect.top - 3) + 'px';
+      ring.style.width = Math.max(0, rect.width + 6) + 'px';
+      ring.style.height = Math.max(0, rect.height + 6) + 'px';
+    }
+
+    function onPointerMove(event) {
+      showRing(candidateFor(event.target));
+    }
+
+    function onPointerDown(event) {
+      if (isPickerUi(event.target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const candidate = candidateFor(event.target);
+
+      if (stage === 'image') {
+        if (!candidate || !isVisible(candidate)) {
+          toast('请直接点击验证码图片或画布');
+          return;
+        }
+        selectedImage = candidate;
+        stage = 'input';
+        ring.style.display = 'none';
+        instruction.textContent = '第 2 步：点击要填入验证码的输入框';
+        return;
+      }
+
+      if (stage !== 'input') return;
+      if (!candidate || !isFillTarget(candidate) || !isVisible(candidate)) {
+        toast('请点击可编辑的 input 或 textarea');
+        return;
+      }
+
+      const input = candidate;
+      const imageSelector = uniqueSelector(selectedImage);
+      const inputSelector = uniqueSelector(input);
+      if (imageSelector && inputSelector) {
+        manualPicks[manualPageKey()] = { image: imageSelector, input: inputSelector };
+        saveManualPicks();
+        toast('已保存当前页面的手动选择');
+      } else {
+        toast('页面结构无法稳定保存，本次选择仍会立即生效');
+      }
+
+      stage = 'done';
+      instruction.textContent = '已选择，正在识别…';
+      ring.style.display = 'none';
+      setTimeout(cleanup, 250);
+      processPair({ input, image: selectedImage }, { force: true }).catch((e) => {
+        debug('手动选择处理失败：' + (e && e.message ? e.message : e));
+        toast('识别失败：' + ((e && e.message) || e));
+      });
+    }
+
+    function onBlockClick(event) {
+      if (isPickerUi(event.target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+
+    function onBlockFollowupPointer(event) {
+      if (isPickerUi(event.target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+
+    function onKeyDown(event) {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      cleanup();
+      toast('已取消手动选择');
+    }
+
+    function cleanup() {
+      if (manualPickerCleanup !== cleanup) return;
+      manualPickerCleanup = null;
+      document.removeEventListener('pointermove', onPointerMove, true);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('pointerup', onBlockFollowupPointer, true);
+      document.removeEventListener('mousedown', onBlockFollowupPointer, true);
+      document.removeEventListener('mouseup', onBlockFollowupPointer, true);
+      document.removeEventListener('click', onBlockClick, true);
+      document.removeEventListener('auxclick', onBlockClick, true);
+      document.removeEventListener('contextmenu', onBlockClick, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      ring.remove();
+      banner.remove();
+    }
+
+    manualPickerCleanup = cleanup;
+    cancel.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      cleanup();
+    });
+    document.addEventListener('pointermove', onPointerMove, true);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('pointerup', onBlockFollowupPointer, true);
+    document.addEventListener('mousedown', onBlockFollowupPointer, true);
+    document.addEventListener('mouseup', onBlockFollowupPointer, true);
+    document.addEventListener('click', onBlockClick, true);
+    document.addEventListener('auxclick', onBlockClick, true);
+    document.addEventListener('contextmenu', onBlockClick, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    toast('手动选择：请点击验证码图片');
   }
 
   // ========================= 填入与提交 =========================
@@ -1349,8 +1638,9 @@
   }
 
   function scan(force) {
-    const pairs = findPairs();
-    if (force) debug('发现 ' + pairs.length + ' 组验证码');
+    const manualPair = resolveManualPair();
+    const pairs = manualPair ? [manualPair] : findPairs();
+    if (force) debug(manualPair ? '使用当前页面的手动选择' : '发现 ' + pairs.length + ' 组验证码');
     for (const pair of pairs) {
       processPair(pair, { force: !!force }).catch((e) => {
         debug('处理异常：' + (e && e.message ? e.message : e));
