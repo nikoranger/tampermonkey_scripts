@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图片验证码自动识别（ddddocr ONNX / Tesseract.js）
 // @namespace    https://github.com/nikoranger/tampermonkey_scripts/tree/main/autofill_authcode
-// @version      1.2.1
+// @version      1.3.0
 // @description  自动识别页面图片验证码并填入对应输入框；ddddocr ONNX 与 Tesseract.js 双引擎，可在油猴脚本菜单切换
 // @author       niko
 // @license      MIT
@@ -31,7 +31,7 @@
  * 1. 引擎切换：Tampermonkey 扩展图标 → 本脚本名称 → 菜单项“识别引擎”。三档：自动（先 A 后 B）/
  *    ddddocr ONNX（浏览器本地推理，准确率高）/ Tesseract.js（无需 ddddocr 模型，准确率一般）。
  * 2. 引擎 A 首次使用会优先从国内 PyPI 镜像下载 ddddocr 1.0.6 wheel（约 6.9MB 下载、13MB 模型），
- *    镜像失败后回退官方源或 GitHub/jsDelivr。下载会显示进度，模型会缓存到当前站点的 Cache Storage。
+ *    镜像失败后回退官方源或 GitHub/jsDelivr。模型会保存到跨站点全局缓存，其他站点无需重复下载。
  *    若全部失败，可用菜单“导入本地模型文件”手动选择 common.onnx。
  * 3. 引擎 B 的 worker / core / 语言包默认使用 npmmirror 与 unpkg，并会自动尝试多个备用线路。
  *    如需自托管，可修改下方 DEFAULT_SETTINGS 里的 tesseract* 路径；同理可修改 ortWasmPaths。
@@ -80,6 +80,9 @@
   const CACHE_NAME = 'captcha-ocr-v1';
   const REMOTE_MODEL_CACHE_KEY = '__captcha_ocr_remote_model__';
   const LOCAL_MODEL_CACHE_KEY = '__captcha_ocr_local_model__';
+  const GLOBAL_MODEL_CACHE_KEY = 'captchaOcr.globalModel.v1';
+  const GLOBAL_MODEL_CHUNK_PREFIX = 'captchaOcr.globalModel.v1.chunk.';
+  const GLOBAL_MODEL_CHUNK_BYTES = 512 * 1024;
 
   const TESSERACT_FALLBACKS = [
     {
@@ -304,10 +307,139 @@
     }
   }
 
+  function bytesToBase64(bytes) {
+    let binary = '';
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToBytes(text) {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function globalChunkKey(token, index) {
+    return GLOBAL_MODEL_CHUNK_PREFIX + token + '.' + index;
+  }
+
+  function removeGlobalModelChunks(meta) {
+    if (!meta || !meta.token) return;
+    const count = Number(meta.count) || 0;
+    for (let i = 0; i < count; i++) {
+      try { GM_setValue(globalChunkKey(meta.token, i), null); } catch (e) {}
+    }
+  }
+
+  function clearGlobalModelCache() {
+    const meta = GM_getValue(GLOBAL_MODEL_CACHE_KEY, null);
+    removeGlobalModelChunks(meta);
+    try { GM_setValue(GLOBAL_MODEL_CACHE_KEY, null); } catch (e) {}
+  }
+
+  function globalModelCacheHasSize(size) {
+    const meta = GM_getValue(GLOBAL_MODEL_CACHE_KEY, null);
+    return !!(meta && meta.version === 1 && meta.size === size);
+  }
+
+  async function putGlobalModelCache(bytes) {
+    if (!bytes || !bytes.length) return false;
+    let payload = bytes;
+    let compressed = false;
+    try {
+      if (typeof CompressionStream !== 'undefined' && typeof Blob !== 'undefined') {
+        const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+        payload = new Uint8Array(await new Response(stream).arrayBuffer());
+        compressed = true;
+      }
+    } catch (e) {
+      debug('全局模型压缩失败，将保存未压缩数据', e);
+      payload = bytes;
+      compressed = false;
+    }
+
+    const token = Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+    const count = Math.ceil(payload.length / GLOBAL_MODEL_CHUNK_BYTES);
+    try {
+      const sha256 = await sha256Hex(bytes);
+      for (let i = 0; i < count; i++) {
+        const start = i * GLOBAL_MODEL_CHUNK_BYTES;
+        GM_setValue(globalChunkKey(token, i), bytesToBase64(payload.subarray(start, start + GLOBAL_MODEL_CHUNK_BYTES)));
+        if (i % 2 === 1) await sleep(0);
+      }
+      const previous = GM_getValue(GLOBAL_MODEL_CACHE_KEY, null);
+      GM_setValue(GLOBAL_MODEL_CACHE_KEY, {
+        version: 1,
+        token,
+        count,
+        size: bytes.length,
+        payloadSize: payload.length,
+        compressed,
+        sha256,
+        createdAt: Date.now(),
+      });
+      removeGlobalModelChunks(previous);
+      debug('全局模型缓存已保存（' + formatBytes(payload.length) + '，' + count + ' 块）');
+      return true;
+    } catch (e) {
+      removeGlobalModelChunks({ token, count });
+      debug('保存全局模型缓存失败：' + (e && e.message ? e.message : e));
+      return false;
+    }
+  }
+
+  async function getGlobalModelCache() {
+    const meta = GM_getValue(GLOBAL_MODEL_CACHE_KEY, null);
+    if (!meta || meta.version !== 1 || !meta.token || !meta.count || !meta.size) return null;
+    try {
+      const parts = [];
+      let total = 0;
+      for (let i = 0; i < meta.count; i++) {
+        const encoded = GM_getValue(globalChunkKey(meta.token, i), null);
+        if (typeof encoded !== 'string' || !encoded) throw new Error('模型分块缺失');
+        const part = base64ToBytes(encoded);
+        parts.push(part);
+        total += part.length;
+        if (i % 2 === 1) await sleep(0);
+      }
+      if (total !== meta.payloadSize) throw new Error('模型分块大小不一致');
+
+      let payload = new Uint8Array(total);
+      let offset = 0;
+      for (const part of parts) {
+        payload.set(part, offset);
+        offset += part.length;
+      }
+
+      let bytes = payload;
+      if (meta.compressed) {
+        if (typeof DecompressionStream === 'undefined') throw new Error('当前浏览器无法解压全局模型缓存');
+        const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream('gzip'));
+        bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+      if (bytes.length !== meta.size) throw new Error('模型大小校验失败');
+      if (meta.sha256) {
+        const actual = await sha256Hex(bytes);
+        if (actual && actual !== meta.sha256) throw new Error('模型校验失败');
+      }
+      debug('已读取全局模型缓存（' + formatBytes(bytes.length) + '）');
+      return bytes;
+    } catch (e) {
+      debug('读取全局模型缓存失败：' + (e && e.message ? e.message : e));
+      clearGlobalModelCache();
+      return null;
+    }
+  }
+
   async function clearModelCache() {
     try {
       if (typeof caches !== 'undefined') await caches.delete(CACHE_NAME);
     } catch (e) { debug('清除缓存失败', e); }
+    clearGlobalModelCache();
   }
 
   // ========================= 网络 =========================
@@ -410,7 +542,7 @@
     initPromise: null,
     bytesPromise: null,
     bytes: null,
-    bytesOrigin: null, // 'local' | 'remote' | 'download'
+    bytesOrigin: null, // 'local' | 'remote' | 'global' | 'download'
     variant: null, // 'logits' | 'index'（输出形态，首次推理后确定）
   };
   let engineGeneration = 0;
@@ -500,7 +632,24 @@
         debug('使用缓存的远程模型');
         engineA.bytes = cached;
         engineA.bytesOrigin = 'remote';
+        if (!globalModelCacheHasSize(cached.length)) {
+          await putGlobalModelCache(cached);
+        }
         return cached;
+      }
+
+      let globalCached = null;
+      if (GM_getValue(GLOBAL_MODEL_CACHE_KEY, null)) {
+        toast('正在读取全局模型缓存…');
+        globalCached = await getGlobalModelCache();
+      }
+      if (generation !== engineGeneration) throw new Error('ddddocr 引擎已重置');
+      if (globalCached && globalCached.length > 100 * 1024) {
+        debug('使用跨站点全局模型缓存');
+        engineA.bytes = globalCached;
+        engineA.bytesOrigin = 'global';
+        cachePut(REMOTE_MODEL_CACHE_KEY, globalCached);
+        return globalCached;
       }
 
       let lastErr = null;
@@ -534,6 +683,9 @@
           engineA.bytes = bytes;
           engineA.bytesOrigin = 'download';
           cachePut(REMOTE_MODEL_CACHE_KEY, bytes);
+          if (!globalModelCacheHasSize(bytes.length)) {
+            await putGlobalModelCache(bytes);
+          }
           debug('模型加载成功，' + (bytes.length / 1048576).toFixed(1) + 'MB');
           return bytes;
         } catch (e) {
@@ -595,9 +747,14 @@
           lastErr = e;
           if (generation !== engineGeneration) throw e;
           const origin = engineA.bytesOrigin;
-          if ((origin === 'local' || origin === 'remote') && attempt < 2) {
+          if ((origin === 'local' || origin === 'remote' || origin === 'global') && attempt < 2) {
             debug('缓存的 ddddocr 模型校验失败，清除后重试：' + (e && e.message ? e.message : e));
-            await cacheDelete(origin === 'local' ? LOCAL_MODEL_CACHE_KEY : REMOTE_MODEL_CACHE_KEY);
+            if (origin === 'local') await cacheDelete(LOCAL_MODEL_CACHE_KEY);
+            if (origin === 'remote') await cacheDelete(REMOTE_MODEL_CACHE_KEY);
+            if (origin === 'global') {
+              clearGlobalModelCache();
+              await cacheDelete(REMOTE_MODEL_CACHE_KEY);
+            }
             engineA.bytes = null;
             engineA.bytesOrigin = null;
             continue;
@@ -1829,6 +1986,7 @@
           engineA.initPromise = null;
           engineA.variant = null;
           await cachePut(LOCAL_MODEL_CACHE_KEY, bytes);
+          await putGlobalModelCache(bytes);
           await releaseDdddSession(oldSession);
           close();
           toast('模型已导入（' + (bytes.length / 1048576).toFixed(1) + 'MB）');
