@@ -42,17 +42,19 @@
 
 ## 引擎 B 的网络路径
 
-Tesseract.js 并非完全离线：首次使用仍会从 jsDelivr 加载 worker、WASM core 和英文语言包。若访问不了 jsDelivr，修改脚本顶部的 `DEFAULT_SETTINGS`：
+Tesseract.js 并非完全离线：首次使用仍会加载 worker、WASM core 和语言包。默认优先使用 npmmirror 的 worker/core 与 unpkg 的语言包；失败后会自动切换到 unpkg、jsDelivr 等备用线路。
+
+如果需要自定义资源地址，可修改脚本顶部的 `DEFAULT_SETTINGS`：
 
 ```js
-tesseractWorkerPath: 'https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js',
-tesseractCorePath:   'https://unpkg.com/tesseract.js-core@v5.1.1',
+tesseractWorkerPath: 'https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/worker.min.js',
+tesseractCorePath:   'https://registry.npmmirror.com/tesseract.js-core/5.1.1/files',
 tesseractLangPath:   'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
 ```
 
 同理，`ortWasmPaths` 可换成 `https://unpkg.com/onnxruntime-web@1.20.1/dist/`。
 
-> 注意：脚本头部的 `@require` 地址也来自 jsDelivr。若安装时网络不通，`onnxruntime-web` / `Tesseract.js` 会加载失败，可在元数据里换成 unpkg 或自托管地址后重新安装。
+> Tesseract.js 主脚本的 `@require` 默认来自 unpkg；若安装时网络不通，可改成自托管地址后重新安装。
 
 ## 匹配机制
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图片验证码自动识别（ddddocr ONNX / Tesseract.js）
 // @namespace    https://github.com/nikoranger/tampermonkey_scripts/tree/main/autofill_authcode
-// @version      1.2.0
+// @version      1.2.1
 // @description  自动识别页面图片验证码并填入对应输入框；ddddocr ONNX 与 Tesseract.js 双引擎，可在油猴脚本菜单切换
 // @author       niko
 // @license      MIT
@@ -18,9 +18,11 @@
 // @connect      files.pythonhosted.org
 // @connect      mirrors.aliyun.com
 // @connect      repo.huaweicloud.com
+// @connect      registry.npmmirror.com
+// @connect      unpkg.com
 // @connect      pypi.org
 // @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js
-// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
+// @require      https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js
 // ==/UserScript==
 
 /*
@@ -31,8 +33,8 @@
  * 2. 引擎 A 首次使用会优先从国内 PyPI 镜像下载 ddddocr 1.0.6 wheel（约 6.9MB 下载、13MB 模型），
  *    镜像失败后回退官方源或 GitHub/jsDelivr。下载会显示进度，模型会缓存到当前站点的 Cache Storage。
  *    若全部失败，可用菜单“导入本地模型文件”手动选择 common.onnx。
- * 3. 引擎 B 的 worker / core / 语言包默认从 jsDelivr 加载。若你的网络访问不了 jsDelivr，
- *    请修改下方 DEFAULT_SETTINGS 里的 tesseract* 路径（unpkg 等镜像亦可）；同理可修改 ortWasmPaths。
+ * 3. 引擎 B 的 worker / core / 语言包默认使用 npmmirror 与 unpkg，并会自动尝试多个备用线路。
+ *    如需自托管，可修改下方 DEFAULT_SETTINGS 里的 tesseract* 路径；同理可修改 ortWasmPaths。
  * 4. 站点定位：使用通用启发式，根据输入框/图片提示词与页面布局自动配对。
  *    特殊页面可从菜单进入“手动选择验证码与填充位置”，选择结果仅保存在本地。
  * 5. 跨域图片默认跳过；确实需要时，在菜单开启“跨域图片读取”并把图片域名加入 @connect。
@@ -66,9 +68,9 @@
 
     // 引擎 B（Tesseract.js）
     tesseractLang: 'eng',
-    tesseractWorkerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
-    tesseractCorePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.1.1',
-    tesseractLangPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+    tesseractWorkerPath: 'https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/worker.min.js',
+    tesseractCorePath: 'https://registry.npmmirror.com/tesseract.js-core/5.1.1/files',
+    tesseractLangPath: 'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
     // 留空则不限制字符；中文验证码请置为 ''
     tesseractWhitelist: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
   };
@@ -78,6 +80,24 @@
   const CACHE_NAME = 'captcha-ocr-v1';
   const REMOTE_MODEL_CACHE_KEY = '__captcha_ocr_remote_model__';
   const LOCAL_MODEL_CACHE_KEY = '__captcha_ocr_local_model__';
+
+  const TESSERACT_FALLBACKS = [
+    {
+      workerPath: 'https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/worker.min.js',
+      corePath: 'https://registry.npmmirror.com/tesseract.js-core/5.1.1/files',
+      langPath: DEFAULT_SETTINGS.tesseractLangPath,
+    },
+    {
+      workerPath: 'https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js',
+      corePath: 'https://unpkg.com/tesseract.js-core@5.1.1',
+      langPath: 'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+    },
+    {
+      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.1.1',
+      langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+    },
+  ];
 
   // 模型来源，按顺序尝试。优先使用国内镜像；所有 wheel 都校验同一个固定 SHA-256。
   const MODEL_SOURCES = [
@@ -116,6 +136,16 @@
   // ========================= 设置与菜单 =========================
   const settings = Object.assign({}, DEFAULT_SETTINGS, GM_getValue(SETTINGS_KEY, {}) || {});
   if (!['auto', 'ddddocr', 'tesseract'].includes(settings.engine)) settings.engine = 'auto';
+  const usesLegacyTesseractDefaults =
+    settings.tesseractWorkerPath === 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js' &&
+    settings.tesseractCorePath === 'https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.1.1' &&
+    settings.tesseractLangPath === 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int';
+  if (usesLegacyTesseractDefaults) {
+    settings.tesseractWorkerPath = DEFAULT_SETTINGS.tesseractWorkerPath;
+    settings.tesseractCorePath = DEFAULT_SETTINGS.tesseractCorePath;
+    settings.tesseractLangPath = DEFAULT_SETTINGS.tesseractLangPath;
+    try { GM_setValue(SETTINGS_KEY, settings); } catch (e) {}
+  }
   const storedManualPicks = GM_getValue(MANUAL_PICKS_KEY, {});
   const manualPicks = storedManualPicks && typeof storedManualPicks === 'object' ? storedManualPicks : {};
   const menuIds = [];
@@ -734,6 +764,24 @@
     return null;
   }
 
+  function buildTesseractSources() {
+    const sources = [
+      {
+        workerPath: settings.tesseractWorkerPath,
+        corePath: settings.tesseractCorePath,
+        langPath: settings.tesseractLangPath,
+      },
+      ...TESSERACT_FALLBACKS,
+    ];
+    const seen = new Set();
+    return sources.filter((source) => {
+      const key = source.workerPath + '|' + source.corePath + '|' + source.langPath;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   async function getTessWorker() {
     if (tessWorker) return tessWorker;
     if (tessWorkerPromise) return tessWorkerPromise;
@@ -744,33 +792,47 @@
       if (!T) {
         throw new Error('Tesseract.js 未加载（@require 可能被网络拦截）');
       }
-      let worker = null;
-      try {
-        worker = await T.createWorker(settings.tesseractLang, 1, {
-          workerPath: settings.tesseractWorkerPath,
-          corePath: settings.tesseractCorePath,
-          langPath: settings.tesseractLangPath,
-          logger: (m) => {
-            if (settings.debug && m && m.status) {
-              debug('[tesseract] ' + m.status + ' ' + Math.round((m.progress || 0) * 100) + '%');
-            }
-          },
-        });
-        const params = { tessedit_pageseg_mode: '7' }; // 单行文本
-        if (settings.tesseractWhitelist) {
-          params.tessedit_char_whitelist = settings.tesseractWhitelist;
-        }
-        await worker.setParameters(params);
+      let lastError = null;
+      let fallbackNotified = false;
+      for (const source of buildTesseractSources()) {
         if (generation !== engineGeneration) throw new Error('Tesseract 引擎已重置');
-        tessWorker = worker;
-        worker = null;
-        return tessWorker;
-      } catch (e) {
-        if (worker) {
-          try { await worker.terminate(); } catch (terminateErr) {}
+        let worker = null;
+        try {
+          debug('加载 Tesseract 资源：' + source.workerPath);
+          worker = await T.createWorker(settings.tesseractLang, 1, {
+            workerPath: source.workerPath,
+            corePath: source.corePath,
+            langPath: source.langPath,
+            logger: (m) => {
+              if (settings.debug && m && m.status) {
+                debug('[tesseract] ' + m.status + ' ' + Math.round((m.progress || 0) * 100) + '%');
+              }
+            },
+          });
+          const params = { tessedit_pageseg_mode: '7' }; // 单行文本
+          if (settings.tesseractWhitelist) {
+            params.tessedit_char_whitelist = settings.tesseractWhitelist;
+          }
+          await worker.setParameters(params);
+          if (generation !== engineGeneration) throw new Error('Tesseract 引擎已重置');
+          tessWorker = worker;
+          worker = null;
+          return tessWorker;
+        } catch (e) {
+          if (worker) {
+            try { await worker.terminate(); } catch (terminateErr) {}
+          }
+          if (generation !== engineGeneration) throw e;
+          lastError = e;
+          debug('Tesseract 资源来源失败：' + source.workerPath + ' → ' + (e && e.message ? e.message : e));
+          if (!fallbackNotified) {
+            fallbackNotified = true;
+            toast('Tesseract 主资源不可用，正在切换备用线路…');
+          }
         }
-        throw e;
       }
+      const lastMessage = lastError && lastError.message ? lastError.message : String(lastError || '');
+      throw new Error('Tesseract 资源加载失败' + (lastMessage ? '：' + lastMessage : ''));
     })();
     tessWorkerPromise = workerPromise;
 
